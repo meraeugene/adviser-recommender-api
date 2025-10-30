@@ -115,6 +115,9 @@ def recommend(project: Project):
         print("Adviser name → ID mapping:", name_to_id)
 
         results = []
+        recommended_adviser_ids = [
+            adviser_id for adviser_id in (name_to_id.get(name) for name in adviser_names) if adviser_id
+        ]
 
         for adviser_name, score in adviser_scores.head(5).items():
             print(f"Processing adviser: {adviser_name} ({score:.4f})")
@@ -161,13 +164,17 @@ def recommend(project: Project):
                 "already_requested": already_requested,
             })
 
+
         if not results:
             print("No advisers found in results.")
             raise HTTPException(status_code=404, detail="No advisers found in the database.")
 
         print("Successfully generated recommendations.")
-        return {"recommendations": results}
-
+        return {
+            "recommendations": results,
+            "recommended_adviser_ids": recommended_adviser_ids
+        }
+    
     except Exception as e:
         import traceback
         print("ERROR OCCURRED IN /recommend ENDPOINT")
