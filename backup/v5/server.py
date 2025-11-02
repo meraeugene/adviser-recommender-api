@@ -130,19 +130,6 @@ def recommend(project: Project, top_n: int = 5):
         user_vec_sbert = sbert_model.encode([user_text])
         user_vec_lr = hstack([user_vec_tfidf, np.array([[0.5]])])  # neutral experience
 
-        # 🏆 Most Similar Thesis
-        all_sbert_sims = cosine_similarity(user_vec_sbert, adviser_embeddings).flatten()
-        df["global_similarity"] = all_sbert_sims
-        top_match = df.sort_values(by="global_similarity", ascending=False).iloc[0]
-
-        most_similar_thesis = {
-            "title": top_match["title"],
-            "adviser_name": top_match["adviser_name"],
-            "similarity": float(top_match["global_similarity"]),
-            "status": top_match.get("status", "active")
-        }
-
-
         # Similarities
         tfidf_sim = cosine_similarity(user_vec_tfidf, vectorizer.transform(df["combined_text"])).flatten()
         sbert_sim = cosine_similarity(user_vec_sbert, adviser_embeddings).flatten()
@@ -284,8 +271,7 @@ def recommend(project: Project, top_n: int = 5):
         return {
             "recommendations": recommendations,
             "recommended_adviser_ids": recommended_ids,
-            "wildcard_advisers": wildcards,
-            "most_similar_thesis": most_similar_thesis
+            "wildcard_advisers": wildcards
         }
 
     except Exception as e:

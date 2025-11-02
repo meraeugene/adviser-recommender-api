@@ -2,7 +2,11 @@ fastapi
 uvicorn
 scikit-learn
 pandas
+numpy
 joblib
 openpyxl
 supabase
 python-dotenv
+sentence-transformers
+scipy
+torch

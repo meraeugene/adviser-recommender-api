@@ -1,7 +1,8 @@
 # ===============================================================
 # Hybrid Adviser Recommender API (FastAPI + Supabase)
-#  v3.2 Balanced Edition (Optimized)
-# TF-IDF + SBERT + Logistic Regression + Experience + Wildcards
+#  v3.2 Balanced Edition 
+# OWNER/CEO/AUTHOR - PRINCE RONIVER MAGSALOS
+# TF-IDF + SBERT + Logistic Regression + Experience + Balancing
 # ===============================================================
 
 from fastapi import FastAPI, HTTPException
@@ -18,16 +19,52 @@ from scipy.sparse import hstack
 import joblib
 import re
 import os
-from dotenv import load_dotenv
 
 # ===============================================================
-# Load Environment Variables
+# Load Environment Variables (Optional)
 # ===============================================================
-load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")  
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-print("✅ Connected to Supabase.")
+print("✅ Supabase connected.")
+
+# ===============================================================
+# Load Models and Data
+# ===============================================================
+print("🔧 Loading model components...")
+vectorizer = joblib.load("vectorizer.pkl")
+log_reg = joblib.load("log_reg.pkl")
+df = pd.read_pickle("adviser_df.pkl")
+
+# Load SBERT model
+sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Only active advisers
+active_advisers = df["adviser_name"].unique().tolist()
+experience_points = df.set_index("adviser_name")["experience_score"].to_dict()
+
+print(f"✅ Loaded {len(df)} active theses for {len(active_advisers)} advisers.")
+
+# ===============================================================
+# FastAPI Setup
+# ===============================================================
+app = FastAPI(title="Hybrid Adviser Recommender API", version="3.3")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # adjust for your frontend
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ===============================================================
+# Pydantic Model
+# ===============================================================
+class Project(BaseModel):
+    title: str
+    abstract: str
+    student_id: str  # for Supabase lookups
 
 # ===============================================================
 # Helper: Clean Text
@@ -40,43 +77,6 @@ def clean_text(text):
     text = str(text)
     text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
     return text.lower().strip()
-
-# ===============================================================
-# FastAPI Setup
-# ===============================================================
-app = FastAPI(title="Hybrid Adviser Recommender API", version="3.3")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ===============================================================
-# Pydantic Model
-# ===============================================================
-class Project(BaseModel):
-    title: str
-    abstract: str
-    student_id: str
-
-# ===============================================================
-# Load Precomputed Model Dictionary (Optional #7)
-# ===============================================================
-print("🔧 Loading model dictionary...")
-model_dict = joblib.load("adviser_prediction_model.pkl")
-
-vectorizer: TfidfVectorizer = model_dict["vectorizer"]
-log_reg: LogisticRegression = model_dict["log_reg"]
-df: pd.DataFrame = model_dict["df"]
-adviser_embeddings: np.ndarray = model_dict["adviser_embeddings"]
-sbert_model: SentenceTransformer = SentenceTransformer("all-MiniLM-L6-v2")
-experience_points: dict = model_dict["experience_points"]
-
-# Only active advisers
-active_advisers = df["adviser_name"].unique().tolist()
-print(f"✅ Loaded {len(df)} active theses for {len(active_advisers)} advisers.")
 
 # ===============================================================
 # Supabase Helper Functions
@@ -113,7 +113,7 @@ def get_adviser_current_leaders(adviser_id: str) -> tuple[int, str]:
     return 0, "Available"
 
 # ===============================================================
-# /recommend Endpoint
+# Main Endpoint
 # ===============================================================
 @app.post("/recommend")
 def recommend(project: Project, top_n: int = 5):
@@ -130,22 +130,9 @@ def recommend(project: Project, top_n: int = 5):
         user_vec_sbert = sbert_model.encode([user_text])
         user_vec_lr = hstack([user_vec_tfidf, np.array([[0.5]])])  # neutral experience
 
-        # 🏆 Most Similar Thesis
-        all_sbert_sims = cosine_similarity(user_vec_sbert, adviser_embeddings).flatten()
-        df["global_similarity"] = all_sbert_sims
-        top_match = df.sort_values(by="global_similarity", ascending=False).iloc[0]
-
-        most_similar_thesis = {
-            "title": top_match["title"],
-            "adviser_name": top_match["adviser_name"],
-            "similarity": float(top_match["global_similarity"]),
-            "status": top_match.get("status", "active")
-        }
-
-
         # Similarities
         tfidf_sim = cosine_similarity(user_vec_tfidf, vectorizer.transform(df["combined_text"])).flatten()
-        sbert_sim = cosine_similarity(user_vec_sbert, adviser_embeddings).flatten()
+        sbert_sim = cosine_similarity(user_vec_sbert, sbert_model.encode(df["combined_text"].tolist())).flatten()
         lr_probs = log_reg.predict_proba(user_vec_lr)[0]
         lr_classes = log_reg.classes_
         lr_score_dict = dict(zip(lr_classes, lr_probs))
@@ -170,7 +157,7 @@ def recommend(project: Project, top_n: int = 5):
                 contrib[adviser][2] += research_score
                 contrib[adviser][3] += lr_score
 
-        # Filter active advisers
+        # Filter active advisers only
         top_advisers = sorted(
             ((a,s) for a,s in scores.items() if a in active_advisers),
             key=lambda x: x[1], reverse=True
@@ -180,7 +167,6 @@ def recommend(project: Project, top_n: int = 5):
         recommendations = []
         recommended_ids = []
 
-        # Build recommendation details
         for adv, score in top_advisers:
             adviser_id = name_to_id.get(adv)
             if adviser_id is None:
@@ -188,6 +174,7 @@ def recommend(project: Project, top_n: int = 5):
             recommended_ids.append(adviser_id)
             currentLeaders, availability = get_adviser_current_leaders(adviser_id)
 
+            # Supabase profile
             profile_res = supabase.table("user_profiles").select(
                 "prefix, full_name, suffix, profile_picture, email, position, research_interest, bio"
             ).eq("user_id", adviser_id).execute()
@@ -200,7 +187,7 @@ def recommend(project: Project, top_n: int = 5):
             )
 
             adv_theses = df[df["adviser_name"] == adv].copy()
-            theses_embs = adviser_embeddings[df[df["adviser_name"]==adv].index]
+            theses_embs = sbert_model.encode(adv_theses["combined_text"].tolist(), show_progress_bar=False)
             sim_scores = cosine_similarity(user_vec_sbert, theses_embs).flatten()
             adv_theses["similarity"] = sim_scores
             top_theses = adv_theses.sort_values(by="similarity", ascending=False).head(5)
@@ -260,7 +247,7 @@ def recommend(project: Project, top_n: int = 5):
                 (", " + profile.get("suffix") if profile.get("suffix") else "")
             )
             adv_theses = wildcard_df[wildcard_df["adviser_name"]==adv].copy()
-            theses_embs = adviser_embeddings[wildcard_df[wildcard_df["adviser_name"]==adv].index]
+            theses_embs = sbert_model.encode(adv_theses["combined_text"].tolist(), show_progress_bar=False)
             adv_theses["similarity"] = cosine_similarity(user_vec_sbert, theses_embs).flatten()
             top_theses = adv_theses.sort_values(by="similarity", ascending=False).head(5)
             wildcards.append({
@@ -284,8 +271,7 @@ def recommend(project: Project, top_n: int = 5):
         return {
             "recommendations": recommendations,
             "recommended_adviser_ids": recommended_ids,
-            "wildcard_advisers": wildcards,
-            "most_similar_thesis": most_similar_thesis
+            "wildcard_advisers": wildcards
         }
 
     except Exception as e:
