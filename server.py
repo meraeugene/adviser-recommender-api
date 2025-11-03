@@ -68,7 +68,7 @@ app = FastAPI(title="Hybrid Adviser Recommender API v3.6", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "https://archivia-official.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
