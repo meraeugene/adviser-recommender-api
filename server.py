@@ -98,13 +98,20 @@ def get_sent_advisers(student_id: str) -> set[str]:
     return {r["adviser_id"] for r in res.data} if res.data else set()
 
 def get_adviser_current_leaders(adviser_id: str):
-    res = supabase.table("adviser_current_leaders").select("current_leaders").eq("adviser_id", adviser_id).execute()
+    res = (
+        supabase.table("adviser_current_leaders")
+        .select("current_leaders")
+        .eq("adviser_id", adviser_id)
+        .execute()
+    )
+
     if res.data:
         cap = res.data[0]
         currentLeaders = cap.get("current_leaders", 0)
-        availability = "Available" if currentLeaders > 0 else "Unavailable"
-        return currentLeaders, availability
+        return currentLeaders, "Available"
+
     return 0, "Available"
+
 
 # ===============================================================
 # Main Recommendation Endpoint
