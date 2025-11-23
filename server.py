@@ -100,7 +100,7 @@ def get_sent_advisers(student_id: str) -> set[str]:
 def get_adviser_current_leaders(adviser_id: str):
     res = (
         supabase.table("adviser_current_leaders")
-        .select("current_leaders")
+        .select("current_leaders, max_limit")
         .eq("adviser_id", adviser_id)
         .execute()
     )
@@ -108,9 +108,15 @@ def get_adviser_current_leaders(adviser_id: str):
     if res.data:
         cap = res.data[0]
         currentLeaders = cap.get("current_leaders", 0)
-        return currentLeaders, "Available"
+        limit = cap.get("max_limit", 0)  # default to 0 if not set
 
-    return 0, "Available"
+        # Only consider full if limit > 0
+        is_full = limit > 0 and currentLeaders >= limit
+        availability = "Unavailable" if is_full else "Available"
+        return currentLeaders, limit, is_full, availability
+
+    # No row found, treat as available with 0 current and 0 limit
+    return 0, 0, False, "Available"
 
 
 # ===============================================================
@@ -153,7 +159,7 @@ def recommend(project: Project):
                 continue
             recommended_adviser_ids.append(adviser_id)
 
-            currentLeaders, availability = get_adviser_current_leaders(adviser_id)
+            currentLeaders, limit, is_full, availability = get_adviser_current_leaders(adviser_id)
 
             profile_res = supabase.table("user_profiles").select(
                 "prefix, full_name, suffix, profile_picture, email, position, research_interest, bio"
@@ -172,8 +178,10 @@ def recommend(project: Project):
                 "id": adviser_id,
                 "full_name": full_name,
                 "score": float(score),
-                "availability": availability,
                 "current_leaders": currentLeaders,
+                "limit": limit,
+                "is_full": is_full,
+                "availability": availability,
                 "already_requested": adviser_id in sent_advisers,
                 "profile_picture": profile.get("profile_picture"),
                 "email": profile.get("email"),
@@ -223,7 +231,7 @@ def recommend(project: Project):
             if not adviser_id:
                 continue
 
-            currentLeaders, availability = get_adviser_current_leaders(adviser_id)
+            currentLeaders, limit, is_full, availability = get_adviser_current_leaders(adviser_id)
             profile_res = supabase.table("user_profiles").select(
                 "prefix, full_name, suffix, profile_picture, email, position, research_interest, bio"
             ).eq("user_id", adviser_id).execute()
@@ -251,8 +259,10 @@ def recommend(project: Project):
             wildcards.append({
                 "id": adviser_id,
                 "full_name": full_name,
-                "availability": availability,
                 "current_leaders": currentLeaders,
+                "limit": limit,
+                "is_full": is_full,
+                "availability": availability,
                 "already_requested": adviser_id in sent_advisers,
                 "profile_picture": profile.get("profile_picture"),
                 "email": profile.get("email"),
