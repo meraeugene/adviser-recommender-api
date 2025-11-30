@@ -275,7 +275,7 @@ def recommend(project: Project):
             user_emb_norm = user_embedding / user_embedding.norm(dim=1, keepdim=True)
             ri_emb_norm = ri_embeddings / ri_embeddings.norm(dim=1, keepdim=True)
             sims = torch.matmul(user_emb_norm, ri_emb_norm.T).squeeze(0).cpu().numpy()
-            df_wildcards["wildcard_score"] = sims
+            df_wildcards.loc[:, "wildcard_score"] = sims
             top_wildcards = df_wildcards.sort_values("wildcard_score", ascending=False).head(3)
 
             for _, row in top_wildcards.iterrows():
