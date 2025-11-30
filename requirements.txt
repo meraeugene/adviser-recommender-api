@@ -6,3 +6,7 @@ scikit-learn
 joblib
 supabase
 python-dotenv
+sentence-transformers
+torch
+matplotlib
+seaborn

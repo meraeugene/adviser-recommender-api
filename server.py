@@ -1,35 +1,26 @@
-# ===============================================================
-# ADVISER RECOMMENDER API (TF-IDF + Experience)
-# FastAPI + Supabase
-# TF-IDF + Experience (Main)
-# Wildcards based solely on Research Interest using TF-IDF
-# Includes past theses in recommendations and wildcards
-# Author: Prince Roniver A. Magsalos & Andrew R. Villalon
-# ===============================================================
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
 import pandas as pd
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 import re
-import joblib
 import os
 from dotenv import load_dotenv
-
+from sentence_transformers import SentenceTransformer
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+from io import BytesIO
+import base64
 
 # ===============================================================
 # Load Environment / Supabase
 # ===============================================================
 print("Initializing Supabase connection...")
 load_dotenv()
-
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ===============================================================
@@ -40,35 +31,70 @@ def clean_text(text):
         return ""
     if isinstance(text, list):
         text = " ".join(map(str, text))
-    text = str(text)
-    text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
+    text = re.sub(r"[^a-zA-Z0-9\s]", " ", str(text))
     return text.lower().strip()
 
 # ===============================================================
-# Load Pretrained Model (PKL)
+# Load Thesis Data
 # ===============================================================
-MODEL_PATH = "adviser_recommender.pkl"
+response = supabase.table("ml_thesis_view").select("*").execute()
+df = pd.DataFrame(response.data)
+df = df[df["status"]=="active"].copy()
+panel_columns = ["panel_member1","panel_member2","panel_member3"]
 
-if not os.path.exists(MODEL_PATH):
-    raise RuntimeError(f" Model file not found: {MODEL_PATH}. Please train and export it first.")
+# ===============================================================
+# SBERT Setup
+# ===============================================================
+print("Loading SBERT model...")
+sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device set to {device}")
 
-model_data = joblib.load(MODEL_PATH)
-vectorizer = model_data["vectorizer"]
-tfidf_matrix = model_data["tfidf_matrix"]
-df = model_data["df"]
-experience_points = model_data["experience_points"]
+# Precompute embeddings at API startup
+print("Precomputing SBERT embeddings for all theses...")
+df["combined_text"] = (df["title"].fillna("") + " " + df["abstract"].fillna("")).apply(clean_text)
+df["embedding"] = list(sbert_model.encode(df["combined_text"].tolist(), convert_to_tensor=True))
+print(f"✅ {len(df)} thesis embeddings precomputed.")
 
-print(f"Loaded pretrained model: {MODEL_PATH}")
-print(f"Loaded {len(df)} theses and {len(experience_points)} adviser experience scores.")
+# ===============================================================
+# Precompute Wildcard Adviser Embeddings
+# ===============================================================
+print("Precomputing wildcard adviser embeddings...")
+df_users = pd.DataFrame(supabase.table("user_profiles").select("user_id, full_name, research_interest").execute().data)
+df_users["research_interest_clean"] = df_users["research_interest"].fillna("").apply(clean_text)
+
+df_users_nonempty = df_users[df_users["research_interest_clean"].str.strip() != ""].copy()
+if not df_users_nonempty.empty:
+    df_users_nonempty["embedding"] = list(
+        sbert_model.encode(df_users_nonempty["research_interest_clean"].tolist(), convert_to_tensor=True)
+    )
+print(f"✅ {len(df_users_nonempty)} wildcard adviser embeddings precomputed.")
+
+# ===============================================================
+# Precompute mappings for fast lookup
+# ===============================================================
+# Adviser -> theses
+adviser_to_theses = {adv: df[df["adviser_name"] == adv].copy() for adv in df["adviser_name"].unique()}
+
+# Adviser -> panel membership counts
+panel_membership = {}
+for adv in df["adviser_name"].unique():
+    panel_count = len(df[df[panel_columns].apply(lambda r: adv in r.values, axis=1)])
+    panel_membership[adv] = panel_count
+
+# Adviser name -> user_id mapping
+all_user_profiles = pd.DataFrame(supabase.table("user_profiles")
+                                 .select("user_id, full_name, prefix, suffix, profile_picture, email, position, research_interest, bio")
+                                 .execute().data)
+name_to_id_global = {r["full_name"]: r["user_id"] for r in all_user_profiles.to_dict(orient="records")}
 
 # ===============================================================
 # FastAPI Setup
 # ===============================================================
-app = FastAPI(title="Hybrid Adviser Recommender API v3.6", version="1.0")
-
+app = FastAPI(title="SBERT Adviser Recommender API", version="1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://archivia-official.vercel.app"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,44 +109,63 @@ class Project(BaseModel):
     student_id: str
 
 # ===============================================================
-# Supabase Helper Functions
+# Supabase helper functions
 # ===============================================================
-def map_adviser_names_to_ids(adviser_names: list[str]) -> dict[str, str]:
-    mapping = {}
-    for name in adviser_names:
-        response = supabase.table("user_profiles").select("user_id").eq("full_name", name).execute()
-        mapping[name] = response.data[0]["user_id"] if response.data else None
-    return mapping
-
 def get_sent_advisers(student_id: str) -> set[str]:
     res = supabase.table("student_requests").select("adviser_id").eq("student_id", student_id)\
         .in_("status", ["pending", "accepted"]).execute()
     return {r["adviser_id"] for r in res.data} if res.data else set()
 
 def get_adviser_current_leaders(adviser_id: str):
-    res = (
-        supabase.table("adviser_current_leaders")
-        .select("current_leaders, max_limit")
-        .eq("adviser_id", adviser_id)
-        .execute()
-    )
-
+    res = supabase.table("adviser_current_leaders").select("current_leaders, max_limit").eq("adviser_id", adviser_id).execute()
     if res.data:
         cap = res.data[0]
         currentLeaders = cap.get("current_leaders", 0)
-        limit = cap.get("max_limit", 0)  # default to 0 if not set
-
-        # Only consider full if limit > 0
+        limit = cap.get("max_limit", 0)
         is_full = limit > 0 and currentLeaders >= limit
         availability = "Unavailable" if is_full else "Available"
         return currentLeaders, limit, is_full, availability
-
-    # No row found, treat as available with 0 current and 0 limit
     return 0, 0, False, "Available"
 
+# ===============================================================
+# Chart generation
+# ===============================================================
+def plot_charts(sim_vals, exp_vals, advisers):
+    angles = np.linspace(0, 2*np.pi, len(advisers), endpoint=False).tolist()
+    angles += angles[:1]
+    sim_vals_plot = sim_vals + sim_vals[:1]
+    exp_vals_plot = exp_vals + exp_vals[:1]
+
+    # Radar chart
+    fig = plt.figure(figsize=(9,9))
+    ax = plt.subplot(111, polar=True)
+    ax.plot(angles, sim_vals_plot, linewidth=2, label="SBERT Similarity")
+    ax.fill(angles, sim_vals_plot, alpha=0.15)
+    ax.plot(angles, exp_vals_plot, linewidth=2, label="Topic Experience")
+    ax.fill(angles, exp_vals_plot, alpha=0.15)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(advisers, fontsize=10)
+    ax.set_title("Radar Chart: Similarity vs Topic Experience", size=14, pad=20)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3,1.1))
+    buf = BytesIO()
+    plt.savefig(buf, format="png")
+    plt.close(fig)
+    radar_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    # Pie chart
+    fig2 = plt.figure(figsize=(7,7))
+    plt.pie(sim_vals, labels=advisers, autopct="%1.1f%%",
+            colors=sns.color_palette("Set3", len(advisers)))
+    plt.title("Average Similarity Share Among Top Advisers")
+    buf2 = BytesIO()
+    plt.savefig(buf2, format="png")
+    plt.close(fig2)
+    pie_base64 = base64.b64encode(buf2.getvalue()).decode("utf-8")
+
+    return radar_base64, pie_base64
 
 # ===============================================================
-# Main Recommendation Endpoint
+# Optimized Recommendation Endpoint
 # ===============================================================
 @app.post("/recommend")
 def recommend(project: Project):
@@ -129,55 +174,83 @@ def recommend(project: Project):
         if not title or not abstract:
             raise HTTPException(status_code=400, detail="Title and abstract are required.")
 
-        sent_advisers = get_sent_advisers(project.student_id)
-        print("📬 Sent advisers:", sent_advisers)
-
-        # Encode user text
         user_text = clean_text(title + " " + abstract)
-        user_vec = vectorizer.transform([user_text])
-        tfidf_sim = cosine_similarity(user_vec, tfidf_matrix).flatten()
+        user_embedding = sbert_model.encode([user_text], convert_to_tensor=True)
+        sent_advisers = get_sent_advisers(project.student_id)
 
-        # Combine TF-IDF and experience
-        exp_scaled = np.log1p(df["experience_score"] * 10) / np.log1p(10)
-        w_tfidf, w_exp = 0.9, 0.1
-        total_scores = (w_tfidf * tfidf_sim) + (w_exp * exp_scaled)
+        advisers = list(adviser_to_theses.keys())
+        adviser_scores, adviser_top_thesis, topic_experience = {}, {}, {}
 
-        df["similarity"] = tfidf_sim
-        df["total_score"] = total_scores
+        # ================== Vectorized Similarity ==================
+        all_embeddings = torch.cat([torch.stack(adviser_to_theses[adv]["embedding"].tolist()) for adv in advisers])
+        all_adviser_index = []
+        for adv in advisers:
+            all_adviser_index.extend([adv]*len(adviser_to_theses[adv]))
+        cos_scores_all = torch.nn.functional.cosine_similarity(
+            user_embedding.repeat(all_embeddings.shape[0],1), all_embeddings
+        ).cpu().numpy()
 
-        # Aggregate by adviser
-        adviser_scores = df.groupby("adviser_name")["total_score"].mean().sort_values(ascending=False).head(5)
-        adviser_names = adviser_scores.index.tolist()
-        name_to_id = map_adviser_names_to_ids(adviser_names)
+        df_scores = pd.DataFrame({"adviser": all_adviser_index, "score": cos_scores_all})
 
+        for adv in advisers:
+            adv_scores = df_scores[df_scores["adviser"] == adv]["score"].values
+            if len(adv_scores) == 0:
+                adviser_scores[adv] = 0
+                adviser_top_thesis[adv] = {"title": "", "similarity": 0}
+                topic_experience[adv] = 0
+                continue
+
+            top_idx = np.argsort(adv_scores)[::-1][:5]
+            top_cos = adv_scores[top_idx]
+            adviser_scores[adv] = 0.7*np.mean(top_cos) + 0.3*np.max(top_cos)
+
+            adv_thesis_df = adviser_to_theses[adv]
+            top_thesis_idx = np.argmax(adv_scores)
+            adviser_top_thesis[adv] = {"title": adv_thesis_df.iloc[top_thesis_idx]["title"],
+                                       "similarity": float(adv_scores[top_thesis_idx])}
+
+            points = 0
+            for idx in top_idx:
+                thesis_row = adv_thesis_df.iloc[idx]
+                if thesis_row["adviser_name"] == adv:
+                    points += 1
+                if adv in thesis_row[panel_columns].values:
+                    points += 0.3
+            topic_experience[adv] = points
+
+        max_exp = max(topic_experience.values()) if topic_experience else 1
+        topic_exp_norm = {k:v/max_exp for k,v in topic_experience.items()}
+        total_scores = {adv: 0.9*adviser_scores[adv]+0.1*topic_exp_norm[adv] for adv in advisers}
+
+        top_advisers = sorted(total_scores.items(), key=lambda x:x[1], reverse=True)[:5]
+        top_adviser_names = [a for a,_ in top_advisers]
+
+        # ================== Results ==================
+        top_profiles = all_user_profiles[all_user_profiles["full_name"].isin(top_adviser_names)].set_index("full_name").to_dict(orient="index")
         results = []
-        recommended_adviser_ids = []
 
-        for adviser_name, score in adviser_scores.items():
-            adviser_id = name_to_id.get(adviser_name)
+        for adv in top_adviser_names:
+            profile = top_profiles.get(adv, {})
+            adviser_id = profile.get("user_id", name_to_id_global.get(adv))
             if not adviser_id:
                 continue
-            recommended_adviser_ids.append(adviser_id)
-
             currentLeaders, limit, is_full, availability = get_adviser_current_leaders(adviser_id)
 
-            profile_res = supabase.table("user_profiles").select(
-                "prefix, full_name, suffix, profile_picture, email, position, research_interest, bio"
-            ).eq("user_id", adviser_id).execute()
-            profile = profile_res.data[0] if profile_res.data else {}
+            adv_theses = adviser_to_theses[adv].copy()
+            adv_theses = adv_theses.assign(
+                similarity=lambda x: torch.nn.functional.cosine_similarity(
+                    user_embedding.repeat(len(x),1), torch.stack(x["embedding"].tolist())
+                ).cpu().numpy()
+            ).sort_values("similarity", ascending=False).head(5)
 
-            full_name = (
-                (profile.get("prefix") + " " if profile.get("prefix") else "") +
-                profile.get("full_name", adviser_name) +
-                (", " + profile.get("suffix") if profile.get("suffix") else "")
-            )
-
-            adv_theses = df[df["adviser_name"] == adviser_name].sort_values(by="similarity", ascending=False).head(5)
+            full_name = (profile.get("prefix","") + " " if profile.get("prefix") else "") + \
+                        profile.get("full_name", adv) + \
+                        (", " + profile.get("suffix") if profile.get("suffix") else "")
 
             results.append({
                 "id": adviser_id,
                 "full_name": full_name,
-                "score": float(score),
+                "score": float(total_scores[adv]),
                 "current_leaders": currentLeaders,
                 "limit": limit,
                 "is_full": is_full,
@@ -189,94 +262,97 @@ def recommend(project: Project):
                 "research_interest": profile.get("research_interest"),
                 "bio": profile.get("bio"),
                 "projects": [
-                    {
-                        "title": row["title"],
-                        "abstract": row["abstract"],
-                        "similarity": float(row["similarity"]),
-                        "status": row["status"],
-                    }
-                    for _, row in adv_theses.iterrows()
+                {"title": row["title"], "abstract": row["abstract"], "similarity": float(row["similarity"])}
+                for _, row in adv_theses.iterrows()
                 ],
             })
 
-        # ===============================================================
-        # Wildcards Based Solely on Research Interest
-        # ===============================================================
-        user_profiles = supabase.table("user_profiles").select("full_name, research_interest").execute()
-        df_users = pd.DataFrame(user_profiles.data)
-        df_users["research_interest"] = df_users["research_interest"].fillna("").apply(clean_text)
-        df_users = df_users[
-            ~df_users["research_interest"].str.strip().str.lower().isin(
-                ["", "to be provided", "tba", "n/a", "none", "not available", "pending"]
-            )
-        ].copy()
-
-        # Exclude top 5 advisers
-        df_users = df_users[~df_users["full_name"].isin(adviser_names)]
-
-        if not df_users.empty:
-            ri_vectorizer = TfidfVectorizer(stop_words="english")
-            ri_matrix = ri_vectorizer.fit_transform(df_users["research_interest"].tolist())
-            user_vec_ri = ri_vectorizer.transform([user_text])
-            sims = cosine_similarity(user_vec_ri, ri_matrix).flatten()
-            df_users["wildcard_score"] = sims
-            top_wildcards = df_users.sort_values(by="wildcard_score", ascending=False).head(3)
-        else:
-            top_wildcards = pd.DataFrame()
-
+        # ================== Wildcards ==================
         wildcards = []
-        for _, row in top_wildcards.iterrows():
-            adviser_name = row["full_name"]
-            adviser_id = map_adviser_names_to_ids([adviser_name]).get(adviser_name)
-            if not adviser_id:
-                continue
+        df_wildcards = df_users_nonempty[~df_users_nonempty["full_name"].isin(top_adviser_names)]
+        if not df_wildcards.empty:
+            ri_embeddings = torch.stack(df_wildcards["embedding"].tolist())
+            user_emb_norm = user_embedding / user_embedding.norm(dim=1, keepdim=True)
+            ri_emb_norm = ri_embeddings / ri_embeddings.norm(dim=1, keepdim=True)
+            sims = torch.matmul(user_emb_norm, ri_emb_norm.T).squeeze(0).cpu().numpy()
+            df_wildcards["wildcard_score"] = sims
+            top_wildcards = df_wildcards.sort_values("wildcard_score", ascending=False).head(3)
 
-            currentLeaders, limit, is_full, availability = get_adviser_current_leaders(adviser_id)
-            profile_res = supabase.table("user_profiles").select(
-                "prefix, full_name, suffix, profile_picture, email, position, research_interest, bio"
-            ).eq("user_id", adviser_id).execute()
-            profile = profile_res.data[0] if profile_res.data else {}
+            for _, row in top_wildcards.iterrows():
+                adv_id = row["user_id"]
+                currentLeaders, limit, is_full, availability = get_adviser_current_leaders(adv_id)
+                profile = all_user_profiles[all_user_profiles["user_id"]==adv_id].to_dict(orient="records")[0]
+                full_name = (profile.get("prefix","") + " " if profile.get("prefix") else "") + \
+                            profile.get("full_name", row["full_name"]) + \
+                            (", " + profile.get("suffix") if profile.get("suffix") else "")
+                wildcards.append({
+                    "id": adv_id,
+                    "full_name": full_name,
+                    "current_leaders": currentLeaders,
+                    "limit": limit,
+                    "is_full": is_full,
+                    "availability": availability,
+                    "already_requested": adv_id in sent_advisers,
+                    "profile_picture": profile.get("profile_picture"),
+                    "email": profile.get("email"),
+                    "position": profile.get("position"),
+                    "research_interest": profile.get("research_interest"),
+                    "bio": profile.get("bio"),
+                    "wildcard_score": float(row["wildcard_score"])
+                })
 
-            full_name = (
-                (profile.get("prefix") + " " if profile.get("prefix") else "") +
-                profile.get("full_name", adviser_name) +
-                (", " + profile.get("suffix") if profile.get("suffix") else "")
-            )
+        # ================== Charts ==================
+        sim_vals = [adviser_scores[a] for a in top_adviser_names]
+        exp_vals = [topic_exp_norm[a] for a in top_adviser_names]
+        radar_base64, pie_base64 = plot_charts(sim_vals, exp_vals, top_adviser_names)
 
-             # Fetch past theses for this wildcard adviser
-            adv_theses = df[df["adviser_name"] == adviser_name].sort_values(by="similarity", ascending=False).head(5)
-            projects = [
-                {
-                    "title": row["title"],
-                    "abstract": row["abstract"],
-                    "similarity": float(row["similarity"]),
-                    "status": row["status"],
-                }
-                for _, row in adv_theses.iterrows()
-            ]
+        # ================== Explanations ==================
+        # ================== Explanations ==================
+        top_similarity_adv = max({k:adviser_scores[k] for k in top_adviser_names}, key=lambda k: adviser_scores[k])
+        top_experience_adv = max({k:topic_exp_norm[k] for k in top_adviser_names}, key=lambda k: topic_exp_norm[k])
+        top_overall_adv = max({k:total_scores[k] for k in top_adviser_names}, key=lambda k: total_scores[k])
+        top1_adv = top_adviser_names[0]
 
+        paragraph_1 = (
+            f"We recommend these advisers because their past research is closely related to your thesis topic. "
+            f"{top_similarity_adv} has the most similar past projects to your idea."
+        )
+        paragraph_2 = (
+            f"\n\nRegarding experience, {top_experience_adv} has the highest topic-based experience "
+            "(supervised or paneled on similar theses), which means they can provide valuable guidance based on prior experience."
+        )
+        paragraph_3 = (
+            f"\n\nLooking at the most closely matching past thesis, {adviser_top_thesis[top1_adv]['title']} "
+            f"was supervised by {top1_adv} with a similarity score of {adviser_top_thesis[top1_adv]['similarity']:.3f}."
+        )
+        paragraph_4 = (
+            f"\n\nOverall, {top_overall_adv} is the best match considering both similarity and experience. "
+            "All advisers above are strong candidates to guide your thesis."
+        )
 
-            wildcards.append({
-                "id": adviser_id,
-                "full_name": full_name,
-                "current_leaders": currentLeaders,
-                "limit": limit,
-                "is_full": is_full,
-                "availability": availability,
-                "already_requested": adviser_id in sent_advisers,
-                "profile_picture": profile.get("profile_picture"),
-                "email": profile.get("email"),
-                "position": profile.get("position"),
-                "research_interest": profile.get("research_interest"),
-                "bio": profile.get("bio"),
-                "wildcard_score": float(row["wildcard_score"]),
-                "projects": projects,
-            })
+        overall_explanation = paragraph_1 + paragraph_2 + paragraph_3 + paragraph_4
+
+        
+        # ---------------------- Top 1 Adviser Detailed Paragraph ----------------------
+        adv_theses_count = len(adviser_to_theses[top1_adv])
+        panel_count = panel_membership.get(top1_adv, 0)
+        top1_thesis = adviser_top_thesis[top1_adv]
+
+        top1_paragraph = (
+            f"{top1_adv} is recommended as your top adviser because their research experience closely matches your thesis topic. "
+            f"They have supervised {adv_theses_count} theses similar to your research area and served as panel member for {panel_count} related theses. "
+            f"Notably, one of their past theses, '{top1_thesis['title']}', has a semantic similarity score of {top1_thesis['similarity']:.3f}. "
+            "This combination of experience and topic relevance makes them highly suitable to guide you."
+        )
 
         return {
             "recommendations": results,
-            "recommended_adviser_ids": recommended_adviser_ids,
+            "recommended_adviser_ids": [name_to_id_global[a] for a in top_adviser_names],
             "wildcard_advisers": wildcards,
+            "radar_chart_base64": radar_base64,
+            "pie_chart_base64": pie_base64,
+            "overall_explanation": overall_explanation,
+            "top1_adviser_explanation": top1_paragraph
         }
 
     except Exception as e:
