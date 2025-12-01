@@ -9,10 +9,6 @@ import os
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 import torch
-import matplotlib.pyplot as plt
-import seaborn as sns
-from io import BytesIO
-import base64
 
 # ===============================================================
 # Load Environment / Supabase
@@ -54,7 +50,7 @@ print(f"Device set to {device}")
 print("Precomputing SBERT embeddings for all theses...")
 df["combined_text"] = (df["title"].fillna("") + " " + df["abstract"].fillna("")).apply(clean_text)
 df["embedding"] = list(sbert_model.encode(df["combined_text"].tolist(), convert_to_tensor=True))
-print(f"✅ {len(df)} thesis embeddings precomputed.")
+print(f"{len(df)} thesis embeddings precomputed.")
 
 # ===============================================================
 # Precompute Wildcard Adviser Embeddings
@@ -68,7 +64,7 @@ if not df_users_nonempty.empty:
     df_users_nonempty["embedding"] = list(
         sbert_model.encode(df_users_nonempty["research_interest_clean"].tolist(), convert_to_tensor=True)
     )
-print(f"✅ {len(df_users_nonempty)} wildcard adviser embeddings precomputed.")
+print(f"{len(df_users_nonempty)} wildcard adviser embeddings precomputed.")
 
 # ===============================================================
 # Precompute mappings for fast lookup
@@ -127,45 +123,9 @@ def get_adviser_current_leaders(adviser_id: str):
         return currentLeaders, limit, is_full, availability
     return 0, 0, False, "Available"
 
-# ===============================================================
-# Chart generation
-# ===============================================================
-def plot_charts(sim_vals, exp_vals, advisers):
-    angles = np.linspace(0, 2*np.pi, len(advisers), endpoint=False).tolist()
-    angles += angles[:1]
-    sim_vals_plot = sim_vals + sim_vals[:1]
-    exp_vals_plot = exp_vals + exp_vals[:1]
-
-    # Radar chart
-    fig = plt.figure(figsize=(9,9))
-    ax = plt.subplot(111, polar=True)
-    ax.plot(angles, sim_vals_plot, linewidth=2, label="SBERT Similarity")
-    ax.fill(angles, sim_vals_plot, alpha=0.15)
-    ax.plot(angles, exp_vals_plot, linewidth=2, label="Topic Experience")
-    ax.fill(angles, exp_vals_plot, alpha=0.15)
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(advisers, fontsize=10)
-    ax.set_title("Radar Chart: Similarity vs Topic Experience", size=14, pad=20)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.3,1.1))
-    buf = BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close(fig)
-    radar_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    # Pie chart
-    fig2 = plt.figure(figsize=(7,7))
-    plt.pie(sim_vals, labels=advisers, autopct="%1.1f%%",
-            colors=sns.color_palette("Set3", len(advisers)))
-    plt.title("Average Similarity Share Among Top Advisers")
-    buf2 = BytesIO()
-    plt.savefig(buf2, format="png")
-    plt.close(fig2)
-    pie_base64 = base64.b64encode(buf2.getvalue()).decode("utf-8")
-
-    return radar_base64, pie_base64
 
 # ===============================================================
-# Optimized Recommendation Endpoint
+# Optimized Recommendation Endpoint (Precomputed Embeddings)
 # ===============================================================
 @app.post("/recommend")
 def recommend(project: Project):
@@ -194,32 +154,47 @@ def recommend(project: Project):
 
         for adv in advisers:
             adv_scores = df_scores[df_scores["adviser"] == adv]["score"].values
+            adv_thesis_df = adviser_to_theses[adv]
+
             if len(adv_scores) == 0:
                 adviser_scores[adv] = 0
                 adviser_top_thesis[adv] = {"title": "", "similarity": 0}
                 topic_experience[adv] = 0
                 continue
 
+            # Top 5 similar theses for this adviser
             top_idx = np.argsort(adv_scores)[::-1][:5]
             top_cos = adv_scores[top_idx]
-            adviser_scores[adv] = 0.7*np.mean(top_cos) + 0.3*np.max(top_cos)
 
-            adv_thesis_df = adviser_to_theses[adv]
+            # Adviser score combining mean and max similarity
+            adviser_scores[adv] = 0.7 * np.mean(top_cos) + 0.3 * np.max(top_cos)
+
+            # Record top thesis
             top_thesis_idx = np.argmax(adv_scores)
-            adviser_top_thesis[adv] = {"title": adv_thesis_df.iloc[top_thesis_idx]["title"],
-                                       "similarity": float(adv_scores[top_thesis_idx])}
+            adviser_top_thesis[adv] = {
+                "title": adv_thesis_df.iloc[top_thesis_idx]["title"],
+                "similarity": float(adv_scores[top_thesis_idx])
+            }
 
+            # ===== New Experience Calculation =====
             points = 0
+
             for idx in top_idx:
                 thesis_row = adv_thesis_df.iloc[idx]
+                # 1 point if adviser supervised it
                 if thesis_row["adviser_name"] == adv:
                     points += 1
-                if adv in thesis_row[panel_columns].values:
-                    points += 0.3
+                # 0.3 points for each panel membership
+                points += sum([0.3 for col in panel_columns if adv == thesis_row[col]])
+                # # Optional: similarity contribution
+                points += 0.5 * adv_scores[idx]
+    
             topic_experience[adv] = points
 
+        # Normalize experience
         max_exp = max(topic_experience.values()) if topic_experience else 1
-        topic_exp_norm = {k:v/max_exp for k,v in topic_experience.items()}
+        topic_exp_norm = {k: v / max_exp for k, v in topic_experience.items()}
+
         total_scores = {adv: 0.9*adviser_scores[adv]+0.1*topic_exp_norm[adv] for adv in advisers}
 
         top_advisers = sorted(total_scores.items(), key=lambda x:x[1], reverse=True)[:5]
@@ -267,25 +242,44 @@ def recommend(project: Project):
                 ],
             })
 
-        # ================== Wildcards ==================
+       # ================== Wildcards ==================
         wildcards = []
-        df_wildcards = df_users_nonempty[~df_users_nonempty["full_name"].isin(top_adviser_names)]
+
+        df_wildcards = df_users_nonempty[
+        ~df_users_nonempty["full_name"].isin(top_adviser_names)
+        ].copy()
+
+
         if not df_wildcards.empty:
             ri_embeddings = torch.stack(df_wildcards["embedding"].tolist())
             user_emb_norm = user_embedding / user_embedding.norm(dim=1, keepdim=True)
             ri_emb_norm = ri_embeddings / ri_embeddings.norm(dim=1, keepdim=True)
-            sims = torch.matmul(user_emb_norm, ri_emb_norm.T).squeeze(0).cpu().numpy()
-            df_wildcards.loc[:, "wildcard_score"] = sims
-            top_wildcards = df_wildcards.sort_values("wildcard_score", ascending=False).head(3)
 
-            for _, row in top_wildcards.iterrows():
+            sims = torch.matmul(user_emb_norm, ri_emb_norm.T).squeeze(0).cpu().numpy()
+
+            df_wildcards.loc[:, "wildcard_score"] = sims
+
+            top_wildcards = df_wildcards.sort_values(
+                "wildcard_score", ascending=False
+            ).head(3)
+
+            for _, row in top_wildcards.iterrows():   
                 adv_id = row["user_id"]
                 currentLeaders, limit, is_full, availability = get_adviser_current_leaders(adv_id)
-                profile = all_user_profiles[all_user_profiles["user_id"]==adv_id].to_dict(orient="records")[0]
-                full_name = (profile.get("prefix","") + " " if profile.get("prefix") else "") + \
-                            profile.get("full_name", row["full_name"]) + \
-                            (", " + profile.get("suffix") if profile.get("suffix") else "")
-                wildcards.append({
+
+                profile_rows = all_user_profiles[all_user_profiles["user_id"] == adv_id]
+                if profile_rows.empty:
+                    continue
+                profile = profile_rows.to_dict(orient="records")[0]
+
+
+                full_name = (
+                    (profile.get("prefix","") + " " if profile.get("prefix") else "")
+                    + profile.get("full_name", row["full_name"])
+                    + (", " + profile.get("suffix") if profile.get("suffix") else "")
+                )
+
+                wildcards.append({   
                     "id": adv_id,
                     "full_name": full_name,
                     "current_leaders": currentLeaders,
@@ -301,12 +295,24 @@ def recommend(project: Project):
                     "wildcard_score": float(row["wildcard_score"])
                 })
 
-        # ================== Charts ==================
-        sim_vals = [adviser_scores[a] for a in top_adviser_names]
-        exp_vals = [topic_exp_norm[a] for a in top_adviser_names]
-        radar_base64, pie_base64 = plot_charts(sim_vals, exp_vals, top_adviser_names)
 
-        # ================== Explanations ==================
+        # ================== Radar Chart Data (Frontend Ready) ==================
+        radar_data = []
+
+        for adv in top_adviser_names:
+            top_thesis = adviser_top_thesis[adv] 
+            radar_data.append({
+                "name": adv,
+                "similarity": float(adviser_scores[adv]),
+                "experience": float(topic_exp_norm[adv]),
+                "overall": float(total_scores[adv]),
+                 "top_project": {
+                "title": top_thesis["title"],
+                "similarity": float(top_thesis["similarity"])
+                }
+            })
+
+
         # ================== Explanations ==================
         top_similarity_adv = max({k:adviser_scores[k] for k in top_adviser_names}, key=lambda k: adviser_scores[k])
         top_experience_adv = max({k:topic_exp_norm[k] for k in top_adviser_names}, key=lambda k: topic_exp_norm[k])
@@ -349,8 +355,8 @@ def recommend(project: Project):
             "recommendations": results,
             "recommended_adviser_ids": [name_to_id_global[a] for a in top_adviser_names],
             "wildcard_advisers": wildcards,
-            "radar_chart_base64": radar_base64,
-            "pie_chart_base64": pie_base64,
+            "radar_data": radar_data,
+            # "pie_chart_base64": pie_base64,
             "overall_explanation": overall_explanation,
             "top1_adviser_explanation": top1_paragraph
         }
