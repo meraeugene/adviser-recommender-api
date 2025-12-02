@@ -104,7 +104,7 @@ class Project(BaseModel):
 # ===============================================================
 def get_sent_advisers(student_id: str) -> set[str]:
     res = supabase.table("student_requests").select("adviser_id").eq("student_id", student_id)\
-        .in_("status", ["pending", "accepted"]).execute()
+        .in_("status", ["pending", "accepted", "referred"]).execute()
     return {r["adviser_id"] for r in res.data} if res.data else set()
 
 def get_adviser_current_leaders(adviser_id: str):
