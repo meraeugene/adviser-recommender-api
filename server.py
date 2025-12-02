@@ -78,11 +78,6 @@ for adv in df["adviser_name"].unique():
     panel_count = len(df[df[panel_columns].apply(lambda r: adv in r.values, axis=1)])
     panel_membership[adv] = panel_count
 
-# Adviser name -> user_id mapping
-all_user_profiles = pd.DataFrame(supabase.table("user_profiles")
-                                 .select("user_id, full_name, prefix, suffix, profile_picture, email, position, research_interest, bio")
-                                 .execute().data)
-name_to_id_global = {r["full_name"]: r["user_id"] for r in all_user_profiles.to_dict(orient="records")}
 
 # ===============================================================
 # FastAPI Setup
@@ -137,6 +132,13 @@ def recommend(project: Project):
         user_text = clean_text(title + " " + abstract)
         user_embedding = sbert_model.encode([user_text], convert_to_tensor=True)
         sent_advisers = get_sent_advisers(project.student_id)
+        
+        # Adviser name -> user_id mapping
+        all_user_profiles = pd.DataFrame(supabase.table("user_profiles")
+                                 .select("user_id, full_name, prefix, suffix, profile_picture, email, position, research_interest, bio")
+                                 .execute().data)
+        name_to_id_global = {r["full_name"]: r["user_id"] for r in all_user_profiles.to_dict(orient="records")}
+
 
         advisers = list(adviser_to_theses.keys())
         adviser_scores, adviser_top_thesis, topic_experience = {}, {}, {}
@@ -244,19 +246,38 @@ def recommend(project: Project):
 
        # ================== Wildcards ==================
         wildcards = []
+        
+        df_users = pd.DataFrame(
+        supabase.table("user_profiles")
+        .select("user_id, full_name, research_interest")
+        .execute().data
+            )
 
+        df_users["research_interest_clean"] = df_users["research_interest"].fillna("").apply(clean_text)
+
+        df_users_nonempty = df_users[df_users["research_interest_clean"].str.strip() != ""].copy()
+
+        # Recompute embeddings dynamically (this is correct for wildcard)
+        df_users_nonempty["embedding"] = list(
+            sbert_model.encode(
+                df_users_nonempty["research_interest_clean"].tolist(),
+                convert_to_tensor=True
+            )
+        )
+        
+        # Exclude already recommended advisers
         df_wildcards = df_users_nonempty[
-        ~df_users_nonempty["full_name"].isin(top_adviser_names)
+            ~df_users_nonempty["full_name"].isin(top_adviser_names)
         ].copy()
 
 
         if not df_wildcards.empty:
             ri_embeddings = torch.stack(df_wildcards["embedding"].tolist())
+            
             user_emb_norm = user_embedding / user_embedding.norm(dim=1, keepdim=True)
             ri_emb_norm = ri_embeddings / ri_embeddings.norm(dim=1, keepdim=True)
 
             sims = torch.matmul(user_emb_norm, ri_emb_norm.T).squeeze(0).cpu().numpy()
-
             df_wildcards.loc[:, "wildcard_score"] = sims
 
             top_wildcards = df_wildcards.sort_values(
@@ -270,8 +291,8 @@ def recommend(project: Project):
                 profile_rows = all_user_profiles[all_user_profiles["user_id"] == adv_id]
                 if profile_rows.empty:
                     continue
+                
                 profile = profile_rows.to_dict(orient="records")[0]
-
 
                 full_name = (
                     (profile.get("prefix","") + " " if profile.get("prefix") else "")
