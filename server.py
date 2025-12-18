@@ -270,6 +270,7 @@ def recommend(project: Project):
             ~df_users_nonempty["full_name"].isin(top_adviser_names)
         ].copy()
 
+        wildcard_adviser_ids = []
 
         if not df_wildcards.empty:
             ri_embeddings = torch.stack(df_wildcards["embedding"].tolist())
@@ -300,6 +301,8 @@ def recommend(project: Project):
                     + (", " + profile.get("suffix") if profile.get("suffix") else "")
                 )
 
+      
+
                 wildcards.append({   
                     "id": adv_id,
                     "full_name": full_name,
@@ -315,6 +318,9 @@ def recommend(project: Project):
                     "bio": profile.get("bio"),
                     "wildcard_score": float(row["wildcard_score"])
                 })
+
+                wildcard_adviser_ids.append(adv_id)
+
 
 
         # ================== Radar Chart Data (Frontend Ready) ==================
@@ -379,7 +385,8 @@ def recommend(project: Project):
             "radar_data": radar_data,
             # "pie_chart_base64": pie_base64,
             "overall_explanation": overall_explanation,
-            "top1_adviser_explanation": top1_paragraph
+            "top1_adviser_explanation": top1_paragraph,
+            "wildcard_adviser_ids": wildcard_adviser_ids
         }
 
     except Exception as e:
